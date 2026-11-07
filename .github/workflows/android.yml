@@ -1,0 +1,71 @@
+name: Build Android APK
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'android/**'
+      - '.github/workflows/android.yml'
+permissions:
+  contents: read
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      SRC: android/upstream/wolpi-prim-ftpd-f0aa774
+      BUILD_TOOLS: '36.0.0'
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: gradle
+
+      - name: Install Android SDK packages
+        run: |
+          SDKM="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$SDKM" --licenses > /dev/null || true
+          "$SDKM" "platforms;android-36" "build-tools;${BUILD_TOOLS}" > /dev/null
+          echo "sdk.dir=$ANDROID_HOME" > "$SRC/local.properties"
+
+      - name: Build unsigned release APK
+        working-directory: ${{ env.SRC }}
+        run: |
+          chmod +x gradlew
+          ./gradlew :primitiveFTPd:assembleRelease --no-daemon --console=plain
+
+      - name: Sign APK
+        env:
+          KS_B64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          KS_PW: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+        run: |
+          set -euo pipefail
+          BT="$ANDROID_HOME/build-tools/${BUILD_TOOLS}"
+          UNSIGNED="$SRC/primitiveFTPd/build/outputs/apk/release/primitiveFTPd-release-unsigned.apk"
+          KS="$RUNNER_TEMP/lc-transfer.jks"
+          if [ -n "${KS_B64:-}" ] && [ -n "${KS_PW:-}" ]; then
+            echo "$KS_B64" | base64 -d > "$KS"
+            export LC_PW="$KS_PW"
+            echo "Signing with the persistent key from repository secrets."
+          else
+            echo "::warning::ANDROID_KEYSTORE_BASE64 / ANDROID_KEYSTORE_PASSWORD not set. Signing with a throw-away key: this APK cannot be updated in place by later builds."
+            export LC_PW="$(openssl rand -hex 24)"
+            keytool -genkeypair -keystore "$KS" -storetype PKCS12 -storepass:env LC_PW -keypass:env LC_PW \
+              -alias lc-transfer -keyalg RSA -keysize 3072 -validity 10000 -dname "CN=LC Transfer (temporary)"
+          fi
+          mkdir -p out
+          "$BT/zipalign" -f -p 4 "$UNSIGNED" "$RUNNER_TEMP/aligned.apk"
+          "$BT/apksigner" sign --ks "$KS" --ks-key-alias lc-transfer \
+            --ks-pass env:LC_PW --key-pass env:LC_PW \
+            --out out/LC-Transfer-android.apk "$RUNNER_TEMP/aligned.apk"
+          "$BT/apksigner" verify --print-certs out/LC-Transfer-android.apk
+          rm -f "$KS"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: LC-Transfer-android-apk
+          path: out/LC-Transfer-android.apk
+          retention-days: 30
